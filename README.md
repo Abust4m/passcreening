@@ -2,6 +2,11 @@
 This repository contains the data and Python scripts used for the machine-learning-guided screening of molecular passivators for perovskite materials.
 
 The workflow integrates literature-derived experimental data, molecular/electronic features, boundary-aware sample weighting, ensemble learning, model interpretation, candidate-property prediction, and auxiliary CAS-number checking. The repository is intended to support reproducibility of the analyses described in the associated manuscript.
+
+## Workflow
+
+<img width="1355" height="874" alt="image" src="https://github.com/user-attachments/assets/6c5461d5-4b7e-4342-ba20-037fe486e272" />
+
 ## Data
 The repository includes the raw data collected from the literature and used as the input dataset for model development and screening.
 
@@ -35,3 +40,6 @@ It is used as an step during candidate screening and information verification.
 Script for prediction of candidate molecules using the trained machine-learning workflow.
 
 It is intended for applying the developed model to candidate compounds during virtual screening.
+
+
+
