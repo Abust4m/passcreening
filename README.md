@@ -14,8 +14,8 @@ The raw data are provided to facilitate:
 
 - inspection of the literature-derived dataset;
 - reproduction of data preprocessing and model development;
-- verification of molecular and experimental information used in the study;
-- further development of machine-learning models for passivator screening.
+- verification of molecular and experimental information used in the study.
+
 ## Python Scripts
 #### `main.py`
 
