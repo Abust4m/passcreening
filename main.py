@@ -1,691 +1,944 @@
-from __future__ import annotations
-import argparse
-import json
-import os
-import re
-import time
-from collections import defaultdict
-import joblib
 import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Descriptors, MACCSkeys, rdFingerprintGenerator
-from sklearn.base import clone
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.gaussian_process import GaussianProcessClassifier
-from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF, RationalQuadratic
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import StandardScaler
+from rdkit.Chem import rdFingerprintGenerator, Descriptors, MACCSkeys
+from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold, train_test_split
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.svm import SVC
-from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import RBF, Matern, RationalQuadratic, ConstantKernel
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
+import joblib
+import json
+import gc
+import os
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
 
-DEFAULT_MORGAN_BITS = 1024
-DEFAULT_MORGAN_RADIUS = 2
-DEFAULT_DFT_COLS = ["HOMO", "Gap", "DM", "is_ionic"]
-N_JOBS = 1
-INNER_SPLITS = 3
-DESC_NAMES = [name for name, _ in Descriptors._descList]
-FORBIDDEN_FEATURES = {
-    "deltaPCE", "dPCE", "labelln", "class1.8", "class1.9", "class2.0",
-    "PCEclass", "report PCE", "Initial PCE", "after PCE",
-}
-FAMILY_ORDER = {"lr": 0, "rf": 1, "svm": 2, "mlp": 3, "xgb": 4, "gpc": 5}
-STACK_BASES = ["rf", "svm", "xgb", "gpc"]
+# 路径和参数
+DATA_PATH = r''
+OUT_DIR = r''
+RANDOM_SEED = 42
+SELECTION_LABEL = 'class1.8'
+CORR_THRESHOLD = 0.80
+QUICK = 0
+N_JOBS = -1
+BAYES_INIT = 2 if QUICK else 10
+BAYES_ITER = 3 if QUICK else 100
 
-DEFAULTS = {
-    "lr": {"C": 0.1},
-    "rf": {"n_estimators": 300, "max_depth": 6, "min_samples_leaf": 1, "max_features": 0.2},
-    "svm": {"C": 1.0, "gamma": 0.1},
-    "mlp": {"h1": 100, "h2": 50, "alpha": 0.001, "lr": 0.001},
-    "xgb": {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.1, "subsample": 0.8,
-            "colsample_bytree": 0.8, "min_child_weight": 1.0, "gamma": 0.0,
-            "reg_alpha": 0.0, "reg_lambda": 1.0},
-    "gpc": {"kernel": "rbf"},
-}
+os.makedirs(OUT_DIR, exist_ok=True)
 
-def norm_smiles(smiles):
-    text = str(smiles).strip()
-    mol = Chem.MolFromSmiles(text)
-    return Chem.MolToSmiles(mol) if mol is not None else re.sub(r"\s+", "", text)
+df = pd.read_csv(DATA_PATH)
+print(f"Dataset size: {df.shape[0]} samples")
 
+df_train, df_test = train_test_split(
+    df, test_size=0.1, random_state=42, stratify=df['class2.0']
+)
+df_train = df_train.reset_index(drop=True)
+df_test = df_test.reset_index(drop=True)
+print(f"Training set size: {df_train.shape[0]} samples")
+print(f"Test set size: {df_test.shape[0]} samples")
 
-def safe_auc(y_true, y_prob):
-    y_true = np.asarray(y_true)
-    if len(np.unique(y_true)) < 2:
-        return float("nan")
-    return float(roc_auc_score(y_true, y_prob))
+def generate_morgan_fingerprint(smiles, radius=2, nBits=1024):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nBits)
+    fp = generator.GetFingerprint(mol)
+    return np.array(fp)
 
+def generate_maccs_keys(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    fp = MACCSkeys.GenMACCSKeys(mol)
+    return np.array(fp)
 
-def compute_sample_weights(delta_pce, threshold, buffer_width=0.1, min_weight=0.3):
-    distance = np.abs(np.asarray(delta_pce, dtype=float) - threshold)
+def generate_rdkit_descriptors(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    descriptors = {}
+    for name, func in Descriptors._descList:
+        try:
+            descriptors[name] = func(mol)
+        except:
+            descriptors[name] = 0
+    return descriptors
+
+def compute_sample_weights(deltaPCE, threshold, buffer_width=0.1, min_weight=0.3):
+    distance = np.abs(deltaPCE - threshold)
     sigma = buffer_width / 2
     normalization = 1 - np.exp(-(buffer_width ** 2) / (2 * sigma ** 2))
-    return np.where(
+    weights = np.where(
         distance <= buffer_width,
         min_weight + (1 - min_weight) * (1 - np.exp(-(distance ** 2) / (2 * sigma ** 2))) / normalization,
-        1.0,
+        1.0
     )
+    return weights
+
+def build_features(data):
+    morgan_fps = []
+    valid_indices = []
+    for idx, smi in enumerate(data['smiles']):
+        fp = generate_morgan_fingerprint(str(smi).strip())
+        if fp is not None:
+            morgan_fps.append(fp)
+            valid_indices.append(idx)
+
+    data_valid = data.iloc[valid_indices].reset_index(drop=True)
+    morgan_df = pd.DataFrame(morgan_fps, columns=[f'morgan_{i}' for i in range(morgan_fps[0].shape[0])])
+
+    maccs_fps = []
+    for smi in data_valid['smiles']:
+        fp = generate_maccs_keys(str(smi).strip())
+        if fp is not None:
+            maccs_fps.append(fp)
+
+    maccs_df = pd.DataFrame(maccs_fps, columns=[f'maccs_{i}' for i in range(167)])
+    print(f"MACCS Keys dimension: {maccs_df.shape[1]}")
+
+    rdkit_descriptors = []
+    for smi in data_valid['smiles']:
+        desc = generate_rdkit_descriptors(str(smi).strip())
+        if desc is not None:
+            rdkit_descriptors.append(desc)
+
+    desc_df_all = pd.DataFrame(rdkit_descriptors)
+    desc_df_all = desc_df_all.fillna(0)
+    desc_df_all = desc_df_all.replace([np.inf, -np.inf], 0)
+
+    # 不再读 correlation_matrix_filtered.csv，描述符先全都留着
+    desc_df = desc_df_all
+
+    print(f"RDKit descriptors: {desc_df_all.shape[1]}")
+
+    dft_cols = ['HOMO', 'Gap', 'DM', 'is_ionic']
+    dft_df = data_valid[dft_cols].copy()
+
+    X_molecular = pd.concat([morgan_df, maccs_df, desc_df], axis=1)
+    X_raw = pd.concat([X_molecular, dft_df], axis=1)
+
+    return X_raw, data_valid
 
 
-def bootstrap_ci(y_true, y_prob, n_boot=1000, alpha=0.05, seed=42):
-    rng = np.random.default_rng(seed)
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    n = len(y_true)
-    values = []
-    for _ in range(n_boot):
-        idx = rng.integers(0, n, n)
-        auc = safe_auc(y_true[idx], y_prob[idx])
-        if not np.isnan(auc):
-            values.append(auc)
-    if not values:
-        return (float("nan"), float("nan"))
-    return tuple(float(v) for v in np.percentile(values, [100 * alpha / 2, 100 * (1 - alpha / 2)]))
+# 每一折都重新做特征筛选，只用这一折的训练数据
+DESCRIPTOR_NAMES = [name for name, _ in Descriptors._descList]
 
 
-def featurize(data: pd.DataFrame, dft_cols, morgan_bits=DEFAULT_MORGAN_BITS,
-              morgan_radius=DEFAULT_MORGAN_RADIUS):
-    for column in ["smiles"] + list(dft_cols):
-        if column not in data.columns:
-            raise SystemExit(f"input table is missing column {column!r}")
-    generator = rdFingerprintGenerator.GetMorganGenerator(radius=morgan_radius, fpSize=morgan_bits)
-    blocks_morgan, blocks_maccs, blocks_desc, keep = [], [], [], []
-    for pos, smiles in enumerate(data["smiles"].astype(str)):
-        mol = Chem.MolFromSmiles(smiles.strip())
-        if mol is None:
-            continue
-        blocks_morgan.append(np.asarray(generator.GetFingerprint(mol), dtype=np.float64))
-        blocks_maccs.append(np.asarray(MACCSkeys.GenMACCSKeys(mol), dtype=np.float64))
-        row = []
-        for _, func in Descriptors._descList:
-            try:
-                value = float(func(mol))
-            except Exception:
-                value = 0.0
-            row.append(value if np.isfinite(value) else 0.0)
-        blocks_desc.append(np.asarray(row, dtype=np.float64))
-        keep.append(pos)
+def fit_preprocess(X_train, y_train):
+    X = X_train.astype(float)
 
-    if not keep:
-        raise SystemExit("No valid SMILES in the input table.")
+    # 去掉常数列
+    keep_cols = [c for c in X.columns if X[c].std() != 0]
 
-    dft = data[dft_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)[keep]
-    dft = np.nan_to_num(dft, nan=0.0, posinf=0.0, neginf=0.0)
+    # 去掉相关系数太高的描述符，只留一个
+    desc_cols = [c for c in DESCRIPTOR_NAMES if c in keep_cols]
+    drop = set()
+    if len(desc_cols) > 1:
+        corr = X[desc_cols].corr().abs()
+        for i in range(len(desc_cols)):
+            a = desc_cols[i]
+            if a in drop:
+                continue
+            for j in range(i + 1, len(desc_cols)):
+                b = desc_cols[j]
+                if b not in drop and corr.iloc[i, j] > CORR_THRESHOLD:
+                    drop.add(b)
+    keep_cols = [c for c in keep_cols if c not in drop]
 
-    X = np.hstack([np.vstack(blocks_morgan), np.vstack(blocks_maccs),
-                   np.vstack(blocks_desc), dft])
-    columns = ([f"morgan_{i}" for i in range(morgan_bits)]
-               + [f"maccs_{i}" for i in range(167)]
-               + list(DESC_NAMES)
-               + list(dft_cols))
-    X_df = pd.DataFrame(X, columns=columns)
-    data_valid = data.iloc[keep].reset_index(drop=True)
+    # 标准化后用 LASSO 选特征
+    scaler = StandardScaler().fit(X[keep_cols])
+    X_scaled = scaler.transform(X[keep_cols])
 
-    overlap = set(X_df.columns) & FORBIDDEN_FEATURES
-    assert not overlap, f"label / PCE columns leaked into features: {sorted(overlap)}"
-    return X_df, data_valid
+    lasso = LogisticRegressionCV(cv=5, random_state=RANDOM_SEED, max_iter=5000,
+                                 penalty='l1', solver='saga', Cs=[0.01, 0.1, 1.0])
+    lasso.fit(X_scaled, y_train)
 
-
-def lasso_mask(Z, y, seed, cs):
-
-    n_features = Z.shape[1]
-    if n_features == 0:
-        return np.zeros(0, dtype=bool)
-    y = np.asarray(y).astype(int)
-    if len(np.unique(y)) < 2:
-        return np.ones(n_features, dtype=bool)
-
-    cs = tuple(float(c) for c in cs) or (0.1,)
-    if len(cs) > 1:
-        n_min = int(np.bincount(y).min())
-        cv = max(2, min(5, n_min))
-        selector = LogisticRegressionCV(Cs=list(cs), cv=cv, penalty="l1", solver="saga",
-                                        scoring="roc_auc", max_iter=5000,
-                                        random_state=seed)
+    coef_abs = np.abs(lasso.coef_[0])
+    nonzero_count = np.sum(coef_abs > 0)
+    if nonzero_count > 50:
+        threshold = np.percentile(coef_abs[coef_abs > 0], 50)
     else:
-        selector = LogisticRegression(C=cs[0], penalty="l1", solver="liblinear",
-                                      max_iter=5000, random_state=seed)
-    selector.fit(Z, y)
-    coef = np.abs(np.ravel(selector.coef_))
-    positive = coef[coef > 0]
-    threshold = float(np.percentile(positive, 50)) if positive.size > 50 else 0.0
-    mask = coef > threshold
-    if not mask.any():
-        top = min(20, coef.size)
-        mask = np.zeros_like(coef, dtype=bool)
-        mask[np.argsort(coef)[-top:]] = True
-    return mask
+        threshold = 0
+
+    mask = coef_abs > threshold
+    if mask.sum() == 0:
+        mask = coef_abs > 0
+    if mask.sum() == 0:
+        mask = np.ones(len(coef_abs), dtype=bool)
+
+    return {'cols': keep_cols, 'scaler': scaler, 'mask': mask}
 
 
-class LeakFreePreprocessor:
-
-    def __init__(self, pruned_columns, scaler, mask, selected_columns, desc_columns):
-        self.pruned_columns = list(pruned_columns)
-        self.scaler = scaler
-        self.mask = np.asarray(mask, dtype=bool)
-        self.selected_columns = list(selected_columns)
-        self.desc_columns = list(desc_columns)
-        assert len(self.mask) == len(self.pruned_columns)
-
-    @classmethod
-    def fit(cls, X_train, y_train, desc_columns, seed, cs=(0.1,), collinear_thr=0.8):
-        X = X_train.astype(float)
-        constant = [c for c in X.columns if float(X[c].std(ddof=0)) == 0.0]
-        desc = [c for c in desc_columns if c in X.columns and c not in constant]
-
-        dropped = set()
-        if len(desc) > 1:
-            corr = X[desc].corr().abs().to_numpy()
-            for i, first in enumerate(desc):
-                if first in dropped:
-                    continue
-                for j in range(i + 1, len(desc)):
-                    second = desc[j]
-                    if second not in dropped and corr[i, j] > collinear_thr:
-                        dropped.add(second)
-
-        pruned = [c for c in X.columns if c not in constant and c not in dropped]
-        scaler = StandardScaler().fit(X[pruned])
-        mask = lasso_mask(scaler.transform(X[pruned]), np.asarray(y_train), seed, cs)
-        selected = [c for c, keep in zip(pruned, mask) if keep]
-        return cls(pruned, scaler, mask, selected, desc_columns)
-
-    def transform(self, X):
-        Z = self.scaler.transform(X.astype(float)[self.pruned_columns])
-        return Z[:, self.mask]
-
-    def as_dict(self):
-        return {
-            "pruned_columns": self.pruned_columns,
-            "scaler": self.scaler,
-            "mask": self.mask,
-            "selected_columns": self.selected_columns,
-            "desc_columns": self.desc_columns,
-        }
-
-    @classmethod
-    def from_dict(cls, payload):
-        return cls(payload["pruned_columns"], payload["scaler"], payload["mask"],
-                   payload["selected_columns"], payload["desc_columns"])
+def apply_preprocess(prep, X):
+    X_scaled = prep['scaler'].transform(X.astype(float)[prep['cols']])
+    return X_scaled[:, prep['mask']]
 
 
-def get_preprocessor(cache, X_df, y, rows, seed, cs):
-    key = np.asarray(rows).tobytes()
-    if key not in cache:
-        cache[key] = LeakFreePreprocessor.fit(X_df.iloc[rows], np.asarray(y)[rows],
-                                              DESC_NAMES, seed, cs)
-    return cache[key]
+X_raw, df_train_valid = build_features(df_train)
+X_test_raw, df_test_valid = build_features(df_test)
 
-def sample_params(family, rng):
-    if family == "lr":
-        return {"C": float(10 ** rng.uniform(-2.0, 1.0))}
-    if family == "rf":
-        return {"n_estimators": int(rng.choice([200, 300, 500])),
-                "max_depth": int(rng.integers(3, 10)),
-                "min_samples_leaf": int(rng.integers(1, 4)),
-                "max_features": float(rng.choice([0.1, 0.2, 0.4, 0.6]))}
-    if family == "svm":
-        return {"C": float(10 ** rng.uniform(-1.0, 1.3)),
-                "gamma": float(10 ** rng.uniform(-3.0, 0.0))}
-    if family == "mlp":
-        return {"h1": int(rng.integers(32, 129)), "h2": int(rng.integers(16, 65)),
-                "alpha": float(10 ** rng.uniform(-4.0, -1.5)),
-                "lr": float(10 ** rng.uniform(-3.5, -2.0))}
-    if family == "xgb":
-        return {"n_estimators": int(rng.integers(200, 600)),
-                "max_depth": int(rng.integers(2, 7)),
-                "learning_rate": float(10 ** rng.uniform(-2.5, -0.7)),
-                "subsample": float(rng.uniform(0.6, 1.0)),
-                "colsample_bytree": float(rng.uniform(0.5, 1.0)),
-                "min_child_weight": float(rng.uniform(1.0, 8.0)),
-                "gamma": float(rng.uniform(0.0, 3.0)),
-                "reg_alpha": float(10 ** rng.uniform(-2.0, 0.0)),
-                "reg_lambda": float(10 ** rng.uniform(-1.0, 1.0))}
-    if family == "gpc":
-        return {"kernel": str(rng.choice(["rbf", "matern15", "matern25", "rq", "const_rbf"]))}
-    raise ValueError(f"unknown family: {family}")
+y_class18 = df_train_valid['class1.8']
+y_class20 = df_train_valid['class2.0']
+y_test_class18 = df_test_valid['class1.8']
+y_test_class20 = df_test_valid['class2.0']
 
+deltaPCE_train = df_train_valid['deltaPCE'].values
+y_select = df_train_valid[SELECTION_LABEL]
 
-def make_kernel(name):
-    if name == "rbf":
-        return RBF(length_scale=1.0)
-    if name == "matern15":
-        return Matern(length_scale=1.0, nu=1.5)
-    if name == "matern25":
-        return Matern(length_scale=1.0, nu=2.5)
-    if name == "rq":
-        return RationalQuadratic(length_scale=1.0, alpha=1.0)
-    if name == "const_rbf":
-        return ConstantKernel(1.0) * RBF(length_scale=1.0)
-    raise ValueError(f"unknown kernel: {name}")
+print(f"Total features: {X_raw.shape[1]}")
 
+# 保存模型用的特征：只用 90% 训练集筛一遍
+prep_train = fit_preprocess(X_raw, y_select)
+selected_names = [c for c, keep in zip(prep_train['cols'], prep_train['mask']) if keep]
+selected_mask = np.array([c in selected_names for c in X_raw.columns])
 
-def build_model(family, params, seed):
-    if family == "lr":
-        return LogisticRegression(C=params["C"], max_iter=5000, random_state=seed)
-    if family == "rf":
-        return RandomForestClassifier(n_estimators=params["n_estimators"],
-                                      max_depth=params["max_depth"],
-                                      min_samples_leaf=params["min_samples_leaf"],
-                                      max_features=params["max_features"],
-                                      random_state=seed, n_jobs=N_JOBS)
-    if family == "svm":
-        return SVC(kernel="rbf", C=params["C"], gamma=params["gamma"],
-                   probability=True, random_state=seed)
-    if family == "mlp":
-        return MLPClassifier(hidden_layer_sizes=(params["h1"], params["h2"]),
-                             alpha=params["alpha"], learning_rate_init=params["lr"],
-                             max_iter=800, early_stopping=True, n_iter_no_change=20,
-                             random_state=seed)
-    if family == "xgb":
-        return XGBClassifier(n_estimators=params["n_estimators"],
-                             max_depth=params["max_depth"],
-                             learning_rate=params["learning_rate"],
-                             subsample=params["subsample"],
-                             colsample_bytree=params["colsample_bytree"],
-                             min_child_weight=params["min_child_weight"],
-                             gamma=params["gamma"], reg_alpha=params["reg_alpha"],
-                             reg_lambda=params["reg_lambda"],
-                             random_state=seed, n_jobs=N_JOBS,
-                             eval_metric="logloss", tree_method="hist")
-    if family == "gpc":
-        return GaussianProcessClassifier(kernel=make_kernel(params["kernel"]),
-                                         random_state=seed)
-    raise ValueError(f"unknown family: {family}")
+scaler = StandardScaler().fit(X_raw)
+X_selected = scaler.transform(X_raw)[:, selected_mask]
+X_test_selected = scaler.transform(X_test_raw)[:, selected_mask]
+feature_names = selected_names
 
+print(f"Features after LASSO: {X_selected.shape[1]}")
 
-def fit_estimator(model, X, y, sample_weight=None):
-    if sample_weight is not None:
-        try:
-            return model.fit(X, y, sample_weight=sample_weight)
-        except (TypeError, ValueError):
-            pass
-    return model.fit(X, y)
+sample_weights_18 = compute_sample_weights(deltaPCE_train, threshold=1.8, buffer_width=0.1, min_weight=0.3)
+sample_weights_20 = compute_sample_weights(deltaPCE_train, threshold=2.0, buffer_width=0.1, min_weight=0.3)
 
-def make_splits(kind, y, groups, n_splits, seed):
-    y = np.asarray(y).astype(int)
-    idx = np.arange(len(y))
-    counts = np.bincount(y) if y.size else np.array([0])
-    smallest = int(counts[counts > 0].min()) if counts.size else 0
+print(f"class1.8 weight range: [{sample_weights_18.min():.3f}, {sample_weights_18.max():.3f}]")
+print(f"class2.0 weight range: [{sample_weights_20.min():.3f}, {sample_weights_20.max():.3f}]")
 
-    if kind == "group" and groups is not None and StratifiedGroupKFold is not None:
-        n_groups = len(np.unique(groups))
-        n_splits = max(2, min(int(n_splits), n_groups, smallest or int(n_splits)))
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        return [(idx[a], idx[b]) for a, b in splitter.split(idx.reshape(-1, 1), y, groups)]
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    n_splits = max(2, min(int(n_splits), smallest or 2))
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return [(idx[a], idx[b]) for a, b in splitter.split(idx.reshape(-1, 1), y)]
+# 每一折单独做一遍，后面所有模型都用这份数据
+print("\nBuilding folds (feature selection inside each fold)...")
+fold_data = []
+for k, (tr, va) in enumerate(skf.split(X_raw, y_class20), 1):
+    prep = fit_preprocess(X_raw.iloc[tr], y_select.iloc[tr])
+    fold_data.append({
+        'tr': tr,
+        'va': va,
+        'Xtr': apply_preprocess(prep, X_raw.iloc[tr]),
+        'Xva': apply_preprocess(prep, X_raw.iloc[va]),
+    })
+    print(f"  fold {k}: {X_raw.shape[1]} features -> {int(prep['mask'].sum())} selected")
 
-
-def assert_disjoint(groups, train_idx, val_idx, label=""):
-    shared = set(groups[train_idx]) & set(groups[val_idx])
-    assert not shared, f"{label}: {len(shared)} group(s) shared between train and validation"
-
-def tune_family(family, X_df, y, groups, train_rows, seed, n_iter, cache, weights,
-                kind, cs):
-    rng = np.random.default_rng(seed + 1000 * (FAMILY_ORDER.get(family, 0) + 1))
-    candidates = [sample_params(family, rng) for _ in range(max(1, int(n_iter)))]
-    candidates.append(DEFAULTS[family])
-
-    inner = make_splits(kind, y[train_rows], groups[train_rows], INNER_SPLITS, seed)
-    best_params, best_score = DEFAULTS[family], -np.inf
-    for params in candidates:
-        fold_auc = []
-        for a, b in inner:
-            fit_rows, val_rows = train_rows[a], train_rows[b]
-            prep = get_preprocessor(cache, X_df, y, fit_rows, seed, cs)
-            X_fit = prep.transform(X_df.iloc[fit_rows])
-            X_val = prep.transform(X_df.iloc[val_rows])
-            w = None if weights is None else weights[fit_rows]
-            model = fit_estimator(build_model(family, params, seed), X_fit, y[fit_rows], w)
-            fold_auc.append(safe_auc(y[val_rows], model.predict_proba(X_val)[:, 1]))
-        score = float(np.nanmean(fold_auc)) if len(fold_auc) else -np.inf
-        if score > best_score:
-            best_params, best_score = params, score
-    return best_params, best_score
-
-
-def fit_stack(bases, meta, X_train, y_train, groups_train, X_val, kind, seed, weights):
-    n = len(y_train)
-    oof = np.zeros((n, len(bases)))
-    inner = make_splits(kind, y_train, groups_train, INNER_SPLITS, seed)
-    for a, b in inner:
-        for j, base in enumerate(bases):
-            w = None if weights is None else weights[a]
-            model = fit_estimator(clone(base), X_train[a], y_train[a], w)
-            oof[b, j] = model.predict_proba(X_train[b])[:, 1]
-    meta_model = clone(meta).fit(oof, y_train)
-    val_meta = np.column_stack([
-        fit_estimator(clone(base), X_train, y_train, weights).predict_proba(X_val)[:, 1]
-        for base in bases
-    ])
-    return meta_model.predict_proba(val_meta)[:, 1]
-
-def run_protocol(kind, X_df, y, groups, weights, families, seed, n_splits, n_iter,
-                 cache, cs, verbose=True):
-    splits = make_splits(kind, y, groups, n_splits, seed)
-    results = defaultdict(list)
-    selected_sizes = []
-
-    for fold, (train_rows, val_rows) in enumerate(splits, 1):
-        if kind == "group":
-            assert_disjoint(groups, train_rows, val_rows, f"fold {fold}")
-
-        prep = get_preprocessor(cache, X_df, y, train_rows, seed, cs)
-        X_train = prep.transform(X_df.iloc[train_rows])
-        X_val = prep.transform(X_df.iloc[val_rows])
-        selected_sizes.append(X_train.shape[1])
-        if verbose:
-            print(f"  [{kind}] fold {fold}/{len(splits)}: train={len(train_rows)} "
-                  f"val={len(val_rows)} selected_features={X_train.shape[1]}", flush=True)
-
-        tuned = {}
-        for family in families:
-            tuned[family], _ = tune_family(family, X_df, y, groups, train_rows, seed,
-                                           n_iter, cache, weights, kind, cs)
-
-        for family in families:
+def cv_with_auc_weighted(model, folds, y, sample_weights=None, use_weight=True):
+    acc_scores = []
+    auc_scores = []
+    f1_scores = []
+    
+    for f in folds:
+        train_idx, test_idx = f['tr'], f['va']
+        X_train, X_test = f['Xtr'], f['Xva']
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        if sample_weights is not None and use_weight:
+            weights_train = sample_weights[train_idx]
             try:
-                model = fit_estimator(build_model(family, tuned[family], seed), X_train,
-                                      y[train_rows], weights[train_rows] if weights is not None else None)
-                results[family].append((y[val_rows], model.predict_proba(X_val)[:, 1]))
-            except Exception as exc:
-                print(f"    [warn] {kind}/{family} fold {fold} failed: {exc}", flush=True)
+                model.fit(X_train, y_train, sample_weight=weights_train)
+            except (TypeError, ValueError):
+                model.fit(X_train, y_train)
+        else:
+            model.fit(X_train, y_train)
+        
+        y_pred = model.predict(X_test)
+        acc_scores.append(accuracy_score(y_test, y_pred))
+        f1_scores.append(f1_score(y_test, y_pred, zero_division=0))
+        
+        if hasattr(model, 'predict_proba'):
+            y_prob = model.predict_proba(X_test)[:, 1]
+            auc_scores.append(roc_auc_score(y_test, y_prob))
+        else:
+            auc_scores.append(np.nan)
+    
+    return np.array(acc_scores), np.array(auc_scores), np.array(f1_scores)
 
-        try:
-            voters = [(family, build_model(family, tuned[family], seed)) for family in families]
-            vote = VotingClassifier(estimators=voters, voting="soft", n_jobs=N_JOBS)
-            vote.fit(X_train, y[train_rows])
-            results["vote_all"].append((y[val_rows], vote.predict_proba(X_val)[:, 1]))
-        except Exception as exc:
-            print(f"    [warn] {kind}/vote_all fold {fold} failed: {exc}", flush=True)
+from xgboost import XGBClassifier
 
-        try:
-            bases = [build_model(family, tuned[family], seed)
-                     for family in STACK_BASES if family in tuned]
-            if len(bases) >= 2:
-                prob = fit_stack(bases, LogisticRegression(max_iter=2000, random_state=seed),
-                                 X_train, y[train_rows], groups[train_rows], X_val, kind, seed,
-                                 weights[train_rows] if weights is not None else None)
-                results["stack_lr"].append((y[val_rows], prob))
-        except Exception as exc:
-            print(f"    [warn] {kind}/stack_lr fold {fold} failed: {exc}", flush=True)
+try:
+    from bayes_opt import BayesianOptimization
+except ImportError:
+    BayesianOptimization = None
 
-    return results, selected_sizes
+rf_pbounds = {
+    'n_estimators': (100, 500),
+    'max_depth': (2, 20),
+    'min_samples_split': (2, 5),
+    'min_samples_leaf': (1, 5),
+    'max_features': (0.3, 1.0)
+}
+xgb_pbounds = {
+    'n_estimators': (100, 500),
+    'max_depth': (2, 7),
+    'learning_rate': (0.01, 0.2),
+    'subsample': (0.6, 1.0),
+    'colsample_bytree': (0.6, 1.0),
+    'min_child_weight': (1, 10),
+    'gamma': (0, 5),
+    'reg_alpha': (0, 1),
+    'reg_lambda': (0.1, 10)
+}
+svm_pbounds = {
+    'C': (0.1, 10),
+    'gamma': (0.001, 1)
+}
+mlp_pbounds = {
+    'hidden_layer_size_1': (50, 200),
+    'hidden_layer_size_2': (20, 100),
+    'alpha': (0.0001, 0.01),
+    'learning_rate_init': (0.0001, 0.01)
+}
+kernel_names = ['RBF', 'RBF*Matern1.5', 'Matern1.5', 'Matern2.5', 'RationalQuadratic', 'Const*RBF']
 
+y_class2 = y_class20
+weights2 = sample_weights_20
+print(f"Class distribution: 0={sum(y_class2==0)}, 1={sum(y_class2==1)}")
 
-def summarize(results):
-    rows = []
-    for name, folds in results.items():
-        aucs, accs, f1s = [], [], []
-        for y_true, y_prob in folds:
-            aucs.append(safe_auc(y_true, y_prob))
-            pred = (np.asarray(y_prob) >= 0.5).astype(int)
-            accs.append(accuracy_score(y_true, pred))
-            f1s.append(f1_score(y_true, pred, zero_division=0))
-        rows.append({
-            "model": name,
-            "auc_mean": float(np.nanmean(aucs)),
-            "auc_std": float(np.nanstd(aucs)),
-            "acc_mean": float(np.mean(accs)),
-            "f1_mean": float(np.mean(f1s)),
-            "n_folds": len(folds),
-        })
-    return pd.DataFrame(rows).sort_values("auc_mean", ascending=False).reset_index(drop=True)
+base_models_2 = {}
 
+lr2 = LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)
+lr_acc2, lr_auc2, lr_f1_2 = cv_with_auc_weighted(lr2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {lr_acc2.mean():.4f}±{lr_acc2.std():.4f}, AUC = {np.nanmean(lr_auc2):.4f}±{np.nanstd(lr_auc2):.4f}, F1 = {np.nanmean(lr_f1_2):.4f}±{np.nanstd(lr_f1_2):.4f}")
+base_models_2['LR'] = (lr_acc2.mean(), lr_acc2.std(), np.nanmean(lr_auc2), np.nanstd(lr_auc2), np.nanmean(lr_f1_2), np.nanstd(lr_f1_2))
 
-def summarize_holdout(y_true, y_prob, seed):
-    pred = (np.asarray(y_prob) >= 0.5).astype(int)
-    low, high = bootstrap_ci(y_true, y_prob, seed=seed)
-    return {
-        "auc": safe_auc(y_true, y_prob),
-        "auc_ci_low": low,
-        "auc_ci_high": high,
-        "accuracy": float(accuracy_score(y_true, pred)),
-        "f1": float(f1_score(y_true, pred, zero_division=0)),
-        "n_samples": int(len(y_true)),
-        "n_positive": int(np.sum(np.asarray(y_true) == 1)),
+rf2 = RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_split=5, random_state=42, n_jobs=N_JOBS)
+rf_acc2, rf_auc2, rf_f1_2 = cv_with_auc_weighted(rf2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {rf_acc2.mean():.4f}±{rf_acc2.std():.4f}, AUC = {np.nanmean(rf_auc2):.4f}±{np.nanstd(rf_auc2):.4f}, F1 = {np.nanmean(rf_f1_2):.4f}±{np.nanstd(rf_f1_2):.4f}")
+base_models_2['RF'] = (rf_acc2.mean(), rf_acc2.std(), np.nanmean(rf_auc2), np.nanstd(rf_auc2), np.nanmean(rf_f1_2), np.nanstd(rf_f1_2))
+
+svm2 = SVC(kernel='rbf', C=1.0, gamma=0.1, probability=True, random_state=42)
+svm_acc2, svm_auc2, svm_f1_2 = cv_with_auc_weighted(svm2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {svm_acc2.mean():.4f}±{svm_acc2.std():.4f}, AUC = {np.nanmean(svm_auc2):.4f}±{np.nanstd(svm_auc2):.4f}, F1 = {np.nanmean(svm_f1_2):.4f}±{np.nanstd(svm_f1_2):.4f}")
+base_models_2['SVM'] = (svm_acc2.mean(), svm_acc2.std(), np.nanmean(svm_auc2), np.nanstd(svm_auc2), np.nanmean(svm_f1_2), np.nanstd(svm_f1_2))
+
+mlp2 = MLPClassifier(hidden_layer_sizes=(100, 50), alpha=0.001, learning_rate_init=0.001, max_iter=500, random_state=42, early_stopping=True)
+mlp_acc2, mlp_auc2, mlp_f1_2 = cv_with_auc_weighted(mlp2, fold_data, y_class2, weights2, use_weight=False)
+print(f"Accuracy = {mlp_acc2.mean():.4f}±{mlp_acc2.std():.4f}, AUC = {np.nanmean(mlp_auc2):.4f}±{np.nanstd(mlp_auc2):.4f}, F1 = {np.nanmean(mlp_f1_2):.4f}±{np.nanstd(mlp_f1_2):.4f}")
+base_models_2['MLP'] = (mlp_acc2.mean(), mlp_acc2.std(), np.nanmean(mlp_auc2), np.nanstd(mlp_auc2), np.nanmean(mlp_f1_2), np.nanstd(mlp_f1_2))
+
+xgb2 = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=N_JOBS, eval_metric='logloss')
+xgb_acc2, xgb_auc2, xgb_f1_2 = cv_with_auc_weighted(xgb2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {xgb_acc2.mean():.4f}±{xgb_acc2.std():.4f}, AUC = {np.nanmean(xgb_auc2):.4f}±{np.nanstd(xgb_auc2):.4f}, F1 = {np.nanmean(xgb_f1_2):.4f}±{np.nanstd(xgb_f1_2):.4f}")
+base_models_2['XGB'] = (xgb_acc2.mean(), xgb_acc2.std(), np.nanmean(xgb_auc2), np.nanstd(xgb_auc2), np.nanmean(xgb_f1_2), np.nanstd(xgb_f1_2))
+
+gpc2 = GaussianProcessClassifier(kernel=RBF(), random_state=42)
+gpc_acc2, gpc_auc2, gpc_f1_2 = cv_with_auc_weighted(gpc2, fold_data, y_class2, weights2, use_weight=False)
+print(f"Accuracy = {gpc_acc2.mean():.4f}±{gpc_acc2.std():.4f}, AUC = {np.nanmean(gpc_auc2):.4f}±{np.nanstd(gpc_auc2):.4f}, F1 = {np.nanmean(gpc_f1_2):.4f}±{np.nanstd(gpc_f1_2):.4f}")
+base_models_2['GPC'] = (gpc_acc2.mean(), gpc_acc2.std(), np.nanmean(gpc_auc2), np.nanstd(gpc_auc2), np.nanmean(gpc_f1_2), np.nanstd(gpc_f1_2))
+
+try:
+    from bayes_opt import BayesianOptimization
+
+    rf_best2 = {
+        'n_estimators': 300,
+        'max_depth': 8,
+        'min_samples_split': 5,
+        'min_samples_leaf': 2,
+        'max_features': 0.5,
     }
+    print(f"Empirical params: n_estimators={rf_best2['n_estimators']}, max_depth={rf_best2['max_depth']}")
+    
+    rf_opt2 = RandomForestClassifier(
+        n_estimators=rf_best2['n_estimators'],
+        max_depth=rf_best2['max_depth'],
+        min_samples_split=rf_best2['min_samples_split'],
+        min_samples_leaf=rf_best2['min_samples_leaf'],
+        max_features=rf_best2['max_features'],
+        random_state=42,
+        n_jobs=N_JOBS
+    )
+    rf_opt_acc2, rf_opt_auc2, rf_opt_f1_2 = cv_with_auc_weighted(rf_opt2, fold_data, y_class2, weights2, use_weight=True)
+    print(f"Accuracy = {rf_opt_acc2.mean():.4f}±{rf_opt_acc2.std():.4f}, AUC = {np.nanmean(rf_opt_auc2):.4f}±{np.nanstd(rf_opt_auc2):.4f}, F1 = {np.nanmean(rf_opt_f1_2):.4f}±{np.nanstd(rf_opt_f1_2):.4f}")
+    base_models_2['RF_Bayes'] = (rf_opt_acc2.mean(), rf_opt_acc2.std(), np.nanmean(rf_opt_auc2), np.nanstd(rf_opt_auc2), np.nanmean(rf_opt_f1_2), np.nanstd(rf_opt_f1_2))
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="Leakage-free passivator classifier")
-    parser.add_argument("--data", default=r"d:\demo1\demo1\train_data.csv",
-                        help="modelling table (smiles, deltaPCE, class2.0, HOMO/Gap/DM/is_ionic)")
-    parser.add_argument("--label", default="class2.0")
-    parser.add_argument("--dft-cols", nargs="+", default=DEFAULT_DFT_COLS)
-    parser.add_argument("--doi-csv", default="data_from_ref.csv",
-                        help="reference table with a DOI column, used when --group-by doi")
-    parser.add_argument("--group-by", choices=["smiles", "doi"], default="smiles")
-    parser.add_argument("--test-frac", type=float, default=0.2)
-    parser.add_argument("--outer-splits", type=int, default=5)
-    parser.add_argument("--inner-splits", type=int, default=3)
-    parser.add_argument("--n-iter", type=int, default=8, help="random configs per family")
-    parser.add_argument("--families", nargs="+", default=list(FAMILY_ORDER),
-                        choices=list(FAMILY_ORDER))
-    parser.add_argument("--lasso-cs", default="0.1",
-                        help="one C, or several comma separated Cs for an inner CV search")
-    parser.add_argument("--weight-threshold", type=float, default=None,
-                        help="deltaPCE threshold for sample weights (default: label based)")
-    parser.add_argument("--no-weights", action="store_true")
-    parser.add_argument("--leak-check", dest="leak_check", action="store_true", default=True)
-    parser.add_argument("--no-leak-check", dest="leak_check", action="store_false")
-    parser.add_argument("--quick", action="store_true", help="fewer configs, 3 outer folds")
-    parser.add_argument("--n-jobs", type=int, default=1,
-                        help="parallelism for RF/XGB/voting (1 = safest)")
-    parser.add_argument("--predict", default=None,
-                        help="CSV to score with a saved run (needs --run)")
-    parser.add_argument("--run", default=None, help="run directory produced by training")
-    parser.add_argument("--predict-out", default="predictions.csv")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out", default=None)
-    return parser
+    def xgb_evaluate2(n_estimators, max_depth, learning_rate, subsample, colsample_bytree, min_child_weight, gamma, reg_alpha, reg_lambda):
+        model = XGBClassifier(
+            n_estimators=int(n_estimators),
+            max_depth=int(max_depth),
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            random_state=42,
+            n_jobs=N_JOBS,
+            eval_metric='logloss'
+        )
+        acc, auc, f1 = cv_with_auc_weighted(model, fold_data, y_class2, weights2, use_weight=True)
+        return np.nanmean(auc)
+    
+    xgb_optimizer2 = BayesianOptimization(f=xgb_evaluate2, pbounds=xgb_pbounds, random_state=42, verbose=0)
+    xgb_optimizer2.maximize(init_points=BAYES_INIT, n_iter=BAYES_ITER)
+    
+    xgb_best2 = xgb_optimizer2.max['params']
+    print(f"Best AUC: {xgb_optimizer2.max['target']:.4f}")
+    
+    xgb_opt2 = XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42,
+        n_jobs=N_JOBS,
+        eval_metric='logloss'
+    )
+    xgb_opt_acc2, xgb_opt_auc2, xgb_opt_f1_2 = cv_with_auc_weighted(xgb_opt2, fold_data, y_class2, weights2, use_weight=True)
+    print(f"Optimized Accuracy = {xgb_opt_acc2.mean():.4f}±{xgb_opt_acc2.std():.4f}, AUC = {np.nanmean(xgb_opt_auc2):.4f}±{np.nanstd(xgb_opt_auc2):.4f}, F1 = {np.nanmean(xgb_opt_f1_2):.4f}±{np.nanstd(xgb_opt_f1_2):.4f}")
+    base_models_2['XGB_Bayes'] = (xgb_opt_acc2.mean(), xgb_opt_acc2.std(), np.nanmean(xgb_opt_auc2), np.nanstd(xgb_opt_auc2), np.nanmean(xgb_opt_f1_2), np.nanstd(xgb_opt_f1_2))
+
+    def svm_evaluate2(C, gamma):
+        model = SVC(kernel='rbf', C=C, gamma=gamma, probability=True, random_state=42)
+        acc, auc, f1 = cv_with_auc_weighted(model, fold_data, y_class2, weights2, use_weight=True)
+        return np.nanmean(auc)
+    
+    svm_optimizer2 = BayesianOptimization(f=svm_evaluate2, pbounds=svm_pbounds, random_state=42, verbose=0)
+    svm_optimizer2.maximize(init_points=BAYES_INIT, n_iter=BAYES_ITER)
+    
+    svm_best2 = svm_optimizer2.max['params']
+    print(f"Best AUC: {svm_optimizer2.max['target']:.4f}")
+    
+    svm_opt2 = SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)
+    svm_opt_acc2, svm_opt_auc2, svm_opt_f1_2 = cv_with_auc_weighted(svm_opt2, fold_data, y_class2, weights2, use_weight=True)
+    print(f"Optimized Accuracy = {svm_opt_acc2.mean():.4f}±{svm_opt_acc2.std():.4f}, AUC = {np.nanmean(svm_opt_auc2):.4f}±{np.nanstd(svm_opt_auc2):.4f}, F1 = {np.nanmean(svm_opt_f1_2):.4f}±{np.nanstd(svm_opt_f1_2):.4f}")
+    base_models_2['SVM_Bayes'] = (svm_opt_acc2.mean(), svm_opt_acc2.std(), np.nanmean(svm_opt_auc2), np.nanstd(svm_opt_auc2), np.nanmean(svm_opt_f1_2), np.nanstd(svm_opt_f1_2))
+
+    def mlp_evaluate2(hidden_layer_size_1, hidden_layer_size_2, alpha, learning_rate_init):
+        model = MLPClassifier(
+            hidden_layer_sizes=(int(hidden_layer_size_1), int(hidden_layer_size_2)),
+            alpha=alpha,
+            learning_rate_init=learning_rate_init,
+            max_iter=500,
+            random_state=42,
+            early_stopping=True
+        )
+        acc, auc, f1 = cv_with_auc_weighted(model, fold_data, y_class2, weights2, use_weight=False)
+        return np.nanmean(auc)
+    
+    mlp_optimizer2 = BayesianOptimization(f=mlp_evaluate2, pbounds=mlp_pbounds, random_state=42, verbose=0)
+    mlp_optimizer2.maximize(init_points=BAYES_INIT, n_iter=BAYES_ITER)
+    
+    mlp_best2 = mlp_optimizer2.max['params']
+    print(f"Best AUC: {mlp_optimizer2.max['target']:.4f}")
+    
+    mlp_opt2 = MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500,
+        random_state=42,
+        early_stopping=True
+    )
+    mlp_opt_acc2, mlp_opt_auc2, mlp_opt_f1_2 = cv_with_auc_weighted(mlp_opt2, fold_data, y_class2, weights2, use_weight=False)
+    print(f"Optimized Accuracy = {mlp_opt_acc2.mean():.4f}±{mlp_opt_acc2.std():.4f}, AUC = {np.nanmean(mlp_opt_auc2):.4f}±{np.nanstd(mlp_opt_auc2):.4f}, F1 = {np.nanmean(mlp_opt_f1_2):.4f}±{np.nanstd(mlp_opt_f1_2):.4f}")
+    base_models_2['MLP_Bayes'] = (mlp_opt_acc2.mean(), mlp_opt_acc2.std(), np.nanmean(mlp_opt_auc2), np.nanstd(mlp_opt_auc2), np.nanmean(mlp_opt_f1_2), np.nanstd(mlp_opt_f1_2))
+
+    gpc_kernels_2 = [
+        RBF(length_scale=1.0),
+        RBF(length_scale=1.0) * Matern(length_scale=1.0, nu=1.5),
+        Matern(length_scale=1.0, nu=1.5),
+        Matern(length_scale=1.0, nu=2.5),
+        RationalQuadratic(length_scale=1.0, alpha=1.0),
+        ConstantKernel(1.0) * RBF(length_scale=1.0),
+    ]
+    
+    gpc_best_score_2 = -np.inf
+    gpc_best_kernel_2 = None
+    gpc_best_kernel_name_2 = None
+    
+    for kernel, name in zip(gpc_kernels_2, kernel_names):
+        gpc_temp = GaussianProcessClassifier(kernel=kernel, random_state=42)
+        acc, auc, f1 = cv_with_auc_weighted(gpc_temp, fold_data, y_class2, weights2, use_weight=False)
+        mean_auc = np.nanmean(auc)
+        print(f"  {name}: AUC = {mean_auc:.4f}")
+        if mean_auc > gpc_best_score_2:
+            gpc_best_score_2 = mean_auc
+            gpc_best_kernel_2 = kernel
+            gpc_best_kernel_name_2 = name
+    
+    print(f"\nBest kernel: {gpc_best_kernel_name_2}, AUC: {gpc_best_score_2:.4f}")
+    
+    gpc_opt2 = GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42)
+    gpc_opt_acc2, gpc_opt_auc2, gpc_opt_f1_2 = cv_with_auc_weighted(gpc_opt2, fold_data, y_class2, weights2, use_weight=False)
+    print(f"Optimized Accuracy = {gpc_opt_acc2.mean():.4f}±{gpc_opt_acc2.std():.4f}, AUC = {np.nanmean(gpc_opt_auc2):.4f}±{np.nanstd(gpc_opt_auc2):.4f}, F1 = {np.nanmean(gpc_opt_f1_2):.4f}±{np.nanstd(gpc_opt_f1_2):.4f}")
+    base_models_2['GPC_GridSearch'] = (gpc_opt_acc2.mean(), gpc_opt_acc2.std(), np.nanmean(gpc_opt_auc2), np.nanstd(gpc_opt_auc2), np.nanmean(gpc_opt_f1_2), np.nanstd(gpc_opt_f1_2))
+    
+except ImportError:
+    print("\nNote: bayes_opt not installed, skipping Bayesian optimization")
+    # 这些参数后面投票、堆叠都要用，要写全
+    rf_best2 = {'n_estimators': 300, 'max_depth': 6, 'min_samples_split': 5,
+                'min_samples_leaf': 1, 'max_features': 0.5}
+    xgb_best2 = {'n_estimators': 200, 'max_depth': 4, 'learning_rate': 0.1,
+                 'subsample': 0.8, 'colsample_bytree': 0.8, 'min_child_weight': 1.0,
+                 'gamma': 0.0, 'reg_alpha': 0.0, 'reg_lambda': 1.0}
+    svm_best2 = {'C': 1.0, 'gamma': 0.1}
+    mlp_best2 = {'hidden_layer_size_1': 100, 'hidden_layer_size_2': 50, 'alpha': 0.001, 'learning_rate_init': 0.001}
+    gpc_best_kernel_2 = RBF()
+
+voting_clf2 = VotingClassifier(
+    estimators=[
+        ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+        ('rf', RandomForestClassifier(
+            n_estimators=int(rf_best2['n_estimators']),
+            max_depth=int(rf_best2['max_depth']),
+            min_samples_split=int(rf_best2['min_samples_split']),
+            min_samples_leaf=int(rf_best2['min_samples_leaf']),
+            max_features=rf_best2['max_features'],
+            random_state=42, n_jobs=N_JOBS)),
+        ('xgb', XGBClassifier(
+            n_estimators=int(xgb_best2['n_estimators']),
+            max_depth=int(xgb_best2['max_depth']),
+            learning_rate=xgb_best2['learning_rate'],
+            subsample=xgb_best2['subsample'],
+            colsample_bytree=xgb_best2['colsample_bytree'],
+            min_child_weight=xgb_best2['min_child_weight'],
+            gamma=xgb_best2['gamma'],
+            reg_alpha=xgb_best2['reg_alpha'],
+            reg_lambda=xgb_best2['reg_lambda'],
+            random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+        ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+        ('mlp', MLPClassifier(
+            hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+            alpha=mlp_best2['alpha'],
+            learning_rate_init=mlp_best2['learning_rate_init'],
+            max_iter=500, random_state=42, early_stopping=True)),
+        ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+    ],
+    voting='soft'
+)
+soft_acc2, soft_auc2, soft_f1_2 = cv_with_auc_weighted(voting_clf2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {soft_acc2.mean():.4f}±{soft_acc2.std():.4f}, AUC = {np.nanmean(soft_auc2):.4f}±{np.nanstd(soft_auc2):.4f}, F1 = {np.nanmean(soft_f1_2):.4f}±{np.nanstd(soft_f1_2):.4f}")
+base_models_2['Soft_Voting'] = (soft_acc2.mean(), soft_acc2.std(), np.nanmean(soft_auc2), np.nanstd(soft_auc2), np.nanmean(soft_f1_2), np.nanstd(soft_f1_2))
+
+voting_clf2_v2 = VotingClassifier(
+    estimators=[
+        ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42)),
+        ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+        ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+        ('mlp', MLPClassifier(
+            hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+            alpha=mlp_best2['alpha'],
+            learning_rate_init=mlp_best2['learning_rate_init'],
+            max_iter=500, random_state=42, early_stopping=True)),
+        ('xgb', XGBClassifier(
+            n_estimators=int(xgb_best2['n_estimators']),
+            max_depth=int(xgb_best2['max_depth']),
+            learning_rate=xgb_best2['learning_rate'],
+            subsample=xgb_best2['subsample'],
+            colsample_bytree=xgb_best2['colsample_bytree'],
+            min_child_weight=xgb_best2['min_child_weight'],
+            gamma=xgb_best2['gamma'],
+            reg_alpha=xgb_best2['reg_alpha'],
+            reg_lambda=xgb_best2['reg_lambda'],
+            random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+    ],
+    voting='soft'
+)
+soft_acc2_v2, soft_auc2_v2, soft_f1_2_v2 = cv_with_auc_weighted(voting_clf2_v2, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {soft_acc2_v2.mean():.4f}±{soft_acc2_v2.std():.4f}, AUC = {np.nanmean(soft_auc2_v2):.4f}±{np.nanstd(soft_auc2_v2):.4f}, F1 = {np.nanmean(soft_f1_2_v2):.4f}±{np.nanstd(soft_f1_2_v2):.4f}")
+base_models_2['Soft_Voting_V2'] = (soft_acc2_v2.mean(), soft_acc2_v2.std(), np.nanmean(soft_auc2_v2), np.nanstd(soft_auc2_v2), np.nanmean(soft_f1_2_v2), np.nanstd(soft_f1_2_v2))
+
+from sklearn.ensemble import StackingClassifier
+estimators_v1_1 = [
+    ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+    ('mlp', MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500, random_state=42, early_stopping=True)),
+    ('xgb', XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+    ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+]
+stacking_v1_1 = StackingClassifier(
+    estimators=estimators_v1_1,
+    final_estimator=LogisticRegressionCV(cv=5, random_state=42, max_iter=1000),
+    cv=5,
+    n_jobs=N_JOBS
+)
+stack_acc_v1_1, stack_auc_v1_1, stack_f1_v1_1 = cv_with_auc_weighted(stacking_v1_1, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {stack_acc_v1_1.mean():.4f}±{stack_acc_v1_1.std():.4f}, AUC = {np.nanmean(stack_auc_v1_1):.4f}±{np.nanstd(stack_auc_v1_1):.4f}, F1 = {np.nanmean(stack_f1_v1_1):.4f}±{np.nanstd(stack_f1_v1_1):.4f}")
+base_models_2['Stacking_V1.1'] = (stack_acc_v1_1.mean(), stack_acc_v1_1.std(), np.nanmean(stack_auc_v1_1), np.nanstd(stack_auc_v1_1), np.nanmean(stack_f1_v1_1), np.nanstd(stack_f1_v1_1))
+
+estimators_v2_1 = [
+    ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+    ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+    ('mlp', MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500, random_state=42, early_stopping=True)),
+    ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+]
+stacking_v2_1 = StackingClassifier(
+    estimators=estimators_v2_1,
+    final_estimator=XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=N_JOBS, eval_metric='logloss'),
+    cv=5,
+    n_jobs=N_JOBS
+)
+stack_acc_v2_1, stack_auc_v2_1, stack_f1_v2_1 = cv_with_auc_weighted(stacking_v2_1, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {stack_acc_v2_1.mean():.4f}±{stack_acc_v2_1.std():.4f}, AUC = {np.nanmean(stack_auc_v2_1):.4f}±{np.nanstd(stack_auc_v2_1):.4f}, F1 = {np.nanmean(stack_f1_v2_1):.4f}±{np.nanstd(stack_f1_v2_1):.4f}")
+base_models_2['Stacking_V2.1'] = (stack_acc_v2_1.mean(), stack_acc_v2_1.std(), np.nanmean(stack_auc_v2_1), np.nanstd(stack_auc_v2_1), np.nanmean(stack_f1_v2_1), np.nanstd(stack_f1_v2_1))
+
+estimators_v4_1 = [
+    ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+    ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+    ('xgb', XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+    ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+]
+stacking_v4_1 = StackingClassifier(
+    estimators=estimators_v4_1,
+    final_estimator=MLPClassifier(hidden_layer_sizes=(100, 50), alpha=0.001, learning_rate_init=0.001, max_iter=500, random_state=42, early_stopping=True),
+    cv=5,
+    n_jobs=N_JOBS
+)
+stack_acc_v4_1, stack_auc_v4_1, stack_f1_v4_1 = cv_with_auc_weighted(stacking_v4_1, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {stack_acc_v4_1.mean():.4f}±{stack_acc_v4_1.std():.4f}, AUC = {np.nanmean(stack_auc_v4_1):.4f}±{np.nanstd(stack_auc_v4_1):.4f}, F1 = {np.nanmean(stack_f1_v4_1):.4f}±{np.nanstd(stack_f1_v4_1):.4f}")
+base_models_2['Stacking_V4.1'] = (stack_acc_v4_1.mean(), stack_acc_v4_1.std(), np.nanmean(stack_auc_v4_1), np.nanstd(stack_auc_v4_1), np.nanmean(stack_f1_v4_1), np.nanstd(stack_f1_v4_1))
+
+estimators_v5_1 = [
+    ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+    ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+    ('mlp', MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500, random_state=42, early_stopping=True)),
+    ('xgb', XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42, n_jobs=N_JOBS, eval_metric='logloss'))
+]
+stacking_v5_1 = StackingClassifier(
+    estimators=estimators_v5_1,
+    final_estimator=GaussianProcessClassifier(kernel=RBF(), random_state=42),
+    cv=5,
+    n_jobs=N_JOBS
+)
+stack_acc_v5_1, stack_auc_v5_1, stack_f1_v5_1 = cv_with_auc_weighted(stacking_v5_1, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {stack_acc_v5_1.mean():.4f}±{stack_acc_v5_1.std():.4f}, AUC = {np.nanmean(stack_auc_v5_1):.4f}±{np.nanstd(stack_auc_v5_1):.4f}, F1 = {np.nanmean(stack_f1_v5_1):.4f}±{np.nanstd(stack_f1_v5_1):.4f}")
+base_models_2['Stacking_V5.1'] = (stack_acc_v5_1.mean(), stack_acc_v5_1.std(), np.nanmean(stack_auc_v5_1), np.nanstd(stack_auc_v5_1), np.nanmean(stack_f1_v5_1), np.nanstd(stack_f1_v5_1))
+
+estimators_v6_1 = [
+    ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+    ('mlp', MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500, random_state=42, early_stopping=True)),
+    ('xgb', XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+    ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+]
+stacking_v6_1 = StackingClassifier(
+    estimators=estimators_v6_1,
+    final_estimator=SVC(kernel='rbf', C=1.0, gamma=0.1, probability=True, random_state=42),
+    cv=5,
+    n_jobs=N_JOBS
+)
+stack_acc_v6_1, stack_auc_v6_1, stack_f1_v6_1 = cv_with_auc_weighted(stacking_v6_1, fold_data, y_class2, weights2, use_weight=True)
+print(f"Accuracy = {stack_acc_v6_1.mean():.4f}±{stack_acc_v6_1.std():.4f}, AUC = {np.nanmean(stack_auc_v6_1):.4f}±{np.nanstd(stack_auc_v6_1):.4f}, F1 = {np.nanmean(stack_f1_v6_1):.4f}±{np.nanstd(stack_f1_v6_1):.4f}")
+base_models_2['Stacking_V6.1'] = (stack_acc_v6_1.mean(), stack_acc_v6_1.std(), np.nanmean(stack_auc_v6_1), np.nanstd(stack_auc_v6_1), np.nanmean(stack_f1_v6_1), np.nanstd(stack_f1_v6_1))
+
+print("\n" + "="*60)
+print("class2.0 Final Ranking (by AUC-ROC):")
+print("="*60)
+sorted_models_2 = sorted(base_models_2.items(), key=lambda x: x[1][2], reverse=True)
+for i, (name, (acc_mean, acc_std, auc_mean, auc_std, f1_mean, f1_std)) in enumerate(sorted_models_2, 1):
+    print(f"{i}. {name}: Acc={acc_mean:.4f}±{acc_std:.4f}, AUC={auc_mean:.4f}±{auc_std:.4f}, F1={f1_mean:.4f}±{f1_std:.4f}")
+
+print("\n" + "="*60)
+print("Saving Top 3 Models for class2.0 SHAP Analysis...")
+print("="*60)
+
+top3_models_2 = sorted_models_2[:3]
+top3_model_names = [name for name, _ in top3_models_2]
+print(f"\nTop 3 models: {top3_model_names}")
+
+model_builders = {
+    'LR': lambda: LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000),
+    'RF': lambda: RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_split=5, random_state=42, n_jobs=N_JOBS),
+    'SVM': lambda: SVC(kernel='rbf', C=1.0, gamma=0.1, probability=True, random_state=42),
+    'MLP': lambda: MLPClassifier(hidden_layer_sizes=(100, 50), alpha=0.001, learning_rate_init=0.001, max_iter=500, random_state=42, early_stopping=True),
+    'XGB': lambda: XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=N_JOBS, eval_metric='logloss'),
+    'GPC': lambda: GaussianProcessClassifier(kernel=RBF(), random_state=42),
+    'RF_Bayes': lambda: RandomForestClassifier(
+        n_estimators=int(rf_best2['n_estimators']),
+        max_depth=int(rf_best2['max_depth']),
+        min_samples_split=int(rf_best2['min_samples_split']),
+        min_samples_leaf=int(rf_best2['min_samples_leaf']),
+        max_features=rf_best2['max_features'],
+        random_state=42, n_jobs=N_JOBS),
+    'XGB_Bayes': lambda: XGBClassifier(
+        n_estimators=int(xgb_best2['n_estimators']),
+        max_depth=int(xgb_best2['max_depth']),
+        learning_rate=xgb_best2['learning_rate'],
+        subsample=xgb_best2['subsample'],
+        colsample_bytree=xgb_best2['colsample_bytree'],
+        min_child_weight=xgb_best2['min_child_weight'],
+        gamma=xgb_best2['gamma'],
+        reg_alpha=xgb_best2['reg_alpha'],
+        reg_lambda=xgb_best2['reg_lambda'],
+        random_state=42, n_jobs=N_JOBS, eval_metric='logloss'),
+    'SVM_Bayes': lambda: SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42),
+    'MLP_Bayes': lambda: MLPClassifier(
+        hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+        alpha=mlp_best2['alpha'],
+        learning_rate_init=mlp_best2['learning_rate_init'],
+        max_iter=500, random_state=42, early_stopping=True),
+    'GPC_GridSearch': lambda: GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42),
+    'Soft_Voting': lambda: VotingClassifier(
+        estimators=[
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('rf', RandomForestClassifier(
+                n_estimators=int(rf_best2['n_estimators']),
+                max_depth=int(rf_best2['max_depth']),
+                min_samples_split=int(rf_best2['min_samples_split']),
+                min_samples_leaf=int(rf_best2['min_samples_leaf']),
+                max_features=rf_best2['max_features'],
+                random_state=42, n_jobs=N_JOBS)),
+            ('xgb', XGBClassifier(
+                n_estimators=int(xgb_best2['n_estimators']),
+                max_depth=int(xgb_best2['max_depth']),
+                learning_rate=xgb_best2['learning_rate'],
+                subsample=xgb_best2['subsample'],
+                colsample_bytree=xgb_best2['colsample_bytree'],
+                min_child_weight=xgb_best2['min_child_weight'],
+                gamma=xgb_best2['gamma'],
+                reg_alpha=xgb_best2['reg_alpha'],
+                reg_lambda=xgb_best2['reg_lambda'],
+                random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True)),
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+        ],
+        voting='soft'),
+    'Soft_Voting_V2': lambda: VotingClassifier(
+        estimators=[
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42)),
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True))
+        ],
+        voting='soft'),
+    'Stacking_V1.1': lambda: StackingClassifier(
+        estimators=[
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True)),
+            ('xgb', XGBClassifier(
+                n_estimators=int(xgb_best2['n_estimators']),
+                max_depth=int(xgb_best2['max_depth']),
+                learning_rate=xgb_best2['learning_rate'],
+                subsample=xgb_best2['subsample'],
+                colsample_bytree=xgb_best2['colsample_bytree'],
+                min_child_weight=xgb_best2['min_child_weight'],
+                gamma=xgb_best2['gamma'],
+                reg_alpha=xgb_best2['reg_alpha'],
+                reg_lambda=xgb_best2['reg_lambda'],
+                random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+        ],
+        final_estimator=LogisticRegressionCV(cv=5, random_state=42, max_iter=1000),
+        cv=5, n_jobs=N_JOBS),
+    'Stacking_V2.1': lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True)),
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+        ],
+        final_estimator=XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1, random_state=42, n_jobs=N_JOBS, eval_metric='logloss'),
+        cv=5, n_jobs=N_JOBS),
+    'Stacking_V4.1': lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('xgb', XGBClassifier(
+                n_estimators=int(xgb_best2['n_estimators']),
+                max_depth=int(xgb_best2['max_depth']),
+                learning_rate=xgb_best2['learning_rate'],
+                subsample=xgb_best2['subsample'],
+                colsample_bytree=xgb_best2['colsample_bytree'],
+                min_child_weight=xgb_best2['min_child_weight'],
+                gamma=xgb_best2['gamma'],
+                reg_alpha=xgb_best2['reg_alpha'],
+                reg_lambda=xgb_best2['reg_lambda'],
+                random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+        ],
+        final_estimator=MLPClassifier(hidden_layer_sizes=(100, 50), alpha=0.001, learning_rate_init=0.001, max_iter=500, random_state=42, early_stopping=True),
+        cv=5, n_jobs=N_JOBS),
+    'Stacking_V5.1': lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('svm', SVC(kernel='rbf', C=svm_best2['C'], gamma=svm_best2['gamma'], probability=True, random_state=42)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True)),
+            ('xgb', XGBClassifier(
+                n_estimators=int(xgb_best2['n_estimators']),
+                max_depth=int(xgb_best2['max_depth']),
+                learning_rate=xgb_best2['learning_rate'],
+                subsample=xgb_best2['subsample'],
+                colsample_bytree=xgb_best2['colsample_bytree'],
+                min_child_weight=xgb_best2['min_child_weight'],
+                gamma=xgb_best2['gamma'],
+                reg_alpha=xgb_best2['reg_alpha'],
+                reg_lambda=xgb_best2['reg_lambda'],
+                random_state=42, n_jobs=N_JOBS, eval_metric='logloss'))
+        ],
+        final_estimator=GaussianProcessClassifier(kernel=RBF(), random_state=42),
+        cv=5, n_jobs=N_JOBS),
+    'Stacking_V6.1': lambda: StackingClassifier(
+        estimators=[
+            ('lr', LogisticRegressionCV(cv=skf, random_state=42, max_iter=2000)),
+            ('mlp', MLPClassifier(
+                hidden_layer_sizes=(int(mlp_best2['hidden_layer_size_1']), int(mlp_best2['hidden_layer_size_2'])),
+                alpha=mlp_best2['alpha'],
+                learning_rate_init=mlp_best2['learning_rate_init'],
+                max_iter=500, random_state=42, early_stopping=True)),
+            ('xgb', XGBClassifier(
+                n_estimators=int(xgb_best2['n_estimators']),
+                max_depth=int(xgb_best2['max_depth']),
+                learning_rate=xgb_best2['learning_rate'],
+                subsample=xgb_best2['subsample'],
+                colsample_bytree=xgb_best2['colsample_bytree'],
+                min_child_weight=xgb_best2['min_child_weight'],
+                gamma=xgb_best2['gamma'],
+                reg_alpha=xgb_best2['reg_alpha'],
+                reg_lambda=xgb_best2['reg_lambda'],
+                random_state=42, n_jobs=N_JOBS, eval_metric='logloss')),
+            ('gpc', GaussianProcessClassifier(kernel=gpc_best_kernel_2, random_state=42))
+        ],
+        final_estimator=SVC(kernel='rbf', C=1.0, gamma=0.1, probability=True, random_state=42),
+        cv=5, n_jobs=N_JOBS),
+}
+
+for i, (model_name, (acc_mean, acc_std, auc_mean, auc_std, f1_mean, f1_std)) in enumerate(top3_models_2, 1):
+    print(f"\n[{i}/3] Training and saving {model_name}...")
+    model = model_builders[model_name]()
+    model.fit(X_selected, y_class2)
+    model_path = f'{OUT_DIR}\\top3_model_class2.0_{i}.pkl'
+    joblib.dump(model, model_path)
+    print(f"  Saved: {model_path}")
+    print(f"  AUC: {auc_mean:.4f}±{auc_std:.4f}, F1: {f1_mean:.4f}±{f1_std:.4f}")
+
+top3_info = {
+    'models': [
+        {'rank': i+1, 'name': name, 'acc_mean': float(acc_mean), 'acc_std': float(acc_std), 
+         'auc_mean': float(auc_mean), 'auc_std': float(auc_std), 
+         'f1_mean': float(f1_mean), 'f1_std': float(f1_std)}
+        for i, (name, (acc_mean, acc_std, auc_mean, auc_std, f1_mean, f1_std)) in enumerate(top3_models_2)
+    ]
+}
+with open(f'{OUT_DIR}\\top3_models_class2.0_info.json', 'w') as f:
+    json.dump(top3_info, f, indent=2)
 
 
-def attach_doi(df, doi_csv):
-    if not os.path.exists(doi_csv):
-        raise SystemExit(f"--group-by doi needs {doi_csv!r} (not found)")
-    ref = pd.read_csv(doi_csv, encoding="utf-8-sig")
-    delta_col = "ΔPCE" if "ΔPCE" in ref.columns else "deltaPCE"
-    for column in ("smiles", "Initial PCE", delta_col, "DOI number"):
-        if column not in ref.columns:
-            raise SystemExit(f"{doi_csv!r} is missing column {column!r}")
+joblib.dump(scaler, f'{OUT_DIR}\\scaler_lite.pkl')
 
-    def keys(frame, delta):
-        return list(zip(frame["smiles"].map(norm_smiles),
-                        frame["Initial PCE"].astype(float).round(2),
-                        frame[delta].astype(float).round(2)))
+feature_names_array = np.array(feature_names)
+np.save(f'{OUT_DIR}\\feature_names_lite.npy', feature_names_array)
 
-    ref = ref.assign(_key=keys(ref, delta_col)).drop_duplicates("_key")
-    mapping = dict(zip(ref["_key"], ref["DOI number"].astype(str).str.strip()))
-    out = df.copy()
-    out["_key"] = keys(out, "deltaPCE")
-    out["DOI"] = out["_key"].map(mapping)
-    matched = int(out["DOI"].notna().sum())
-    print(f"[doi] matched {matched}/{len(out)} rows to a DOI")
-    return out.drop(columns=["_key"])
+original_feature_names = np.array(X_raw.columns.tolist())
+np.save(f'{OUT_DIR}\\original_feature_names_lite.npy', original_feature_names)
+np.save(f'{OUT_DIR}\\selected_mask_lite.npy', selected_mask)
+np.save(f'{OUT_DIR}\\X_selected_lite.npy', X_selected)
+y_class18_arr = y_class18.values
+y_class20_arr = y_class20.values
+np.save(f'{OUT_DIR}\\y_class18_lite.npy', y_class18_arr)
+np.save(f'{OUT_DIR}\\y_class20_lite.npy', y_class20_arr)
 
+print("\n" + "="*60)
+print("Test Set Evaluation (10% Hold-out Set)")
+print("="*60)
 
-def assign_groups(df, group_by):
-    df = df.copy()
-    df["group_smiles"] = df["smiles"].map(norm_smiles)
-    if group_by == "doi" and "DOI" in df.columns:
-        df["group"] = df["DOI"].fillna("noDOI::" + df["group_smiles"])
+def fit_and_test(model, X_train, y_train, sample_weights, X_test, y_test):
+    try:
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+    except (TypeError, ValueError):
+        model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    if hasattr(model, 'predict_proba'):
+        auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
     else:
-        df["group"] = df["group_smiles"]
-    print(f"[group] {df['group'].nunique()} groups for {len(df)} rows "
-          f"({df['group_smiles'].nunique()} unique molecules)")
-    return df
+        auc = np.nan
+    return acc, auc, f1
 
+test_results = {}
+for model_name, _ in sorted_models_2:
+    model = model_builders[model_name]()
+    acc, auc, f1 = fit_and_test(model, X_selected, y_class2, weights2, X_test_selected, y_test_class20)
+    test_results[model_name] = (acc, auc, f1)
 
-def split_holdout(df, y, groups, test_frac, seed):
-    n_splits = max(2, int(round(1.0 / test_frac)))
-    for attempt in range(20):
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed + attempt)
-        train_rows, test_rows = next(splitter.split(np.zeros((len(df), 1)), y, groups))
-        if len(np.unique(y[test_rows])) == 2:
-            break
-    else:
-        raise SystemExit("Could not build a holdout with both classes; adjust --test-frac/--seed")
-    assert_disjoint(groups, train_rows, test_rows, "holdout")
-    return train_rows, test_rows
+print(f"Test set size: {X_test_selected.shape[0]} samples")
+print("\nclass2.0 Test Ranking (by AUC-ROC):")
+for i, (name, (acc, auc, f1)) in enumerate(sorted(test_results.items(), key=lambda x: x[1][1], reverse=True), 1):
+    print(f"{i}. {name}: Accuracy = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
 
-
-def run_predict(args):
-    if not args.run:
-        raise SystemExit("--predict needs --run <run_dir>")
-    prep = LeakFreePreprocessor.from_dict(joblib.load(os.path.join(args.run, "preprocess.joblib")))
-    model = joblib.load(os.path.join(args.run, "model.joblib"))
-    df = pd.read_csv(args.predict)
-    X_df, data = featurize(df, args.dft_cols)
-    prob = model.predict_proba(prep.transform(X_df))[:, 1]
-    out = data.copy()
-    out["passivator_probability"] = prob
-    out["prediction"] = np.where(prob >= 0.5, "PASSIVATOR", "NON-PASSIVATOR")
-    out = out.sort_values("passivator_probability", ascending=False)
-    out.to_csv(args.predict_out, index=False)
-    print(f"[predict] {len(out)} molecules -> {args.predict_out}")
-    print(out[["smiles", "passivator_probability", "prediction"]].head(10).to_string(index=False))
-    return 0
-
-
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    if args.predict:
-        return run_predict(args)
-    if args.quick:
-        args.n_iter = min(args.n_iter, 3)
-        args.outer_splits = min(args.outer_splits, 3)
-
-    global N_JOBS, INNER_SPLITS
-    N_JOBS = args.n_jobs
-    INNER_SPLITS = args.inner_splits
-    started = time.time()
-    seed = args.seed
-    np.random.seed(seed)
-    run_dir = args.out or os.path.join("runs", time.strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(run_dir, exist_ok=True)
-    log_path = os.path.join(run_dir, "run.log")
-
-    def log(message):
-        print(message, flush=True)
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(message + "\n")
-
-    log(f"[run] started {time.strftime('%Y-%m-%d %H:%M:%S')} -> {run_dir}")
-
-    df = pd.read_csv(args.data)
-    if args.label not in df.columns:
-        raise SystemExit(f"{args.data!r} has no column {args.label!r}")
-    if args.group_by == "doi":
-        df = attach_doi(df, args.doi_csv)
-    df = assign_groups(df, args.group_by)
-
-    weights_threshold = args.weight_threshold
-    if weights_threshold is None:
-        weights_threshold = 2.0 if args.label == "class2.0" else 1.8
-
-    X_df, data = featurize(df, args.dft_cols)
-    y = data[args.label].to_numpy().astype(int)
-    groups = data["group"].to_numpy()
-    delta = data["deltaPCE"].to_numpy(dtype=float)
-    weights = None if args.no_weights else compute_sample_weights(delta, weights_threshold)
-    log(f"[data] {len(data)} usable rows, {X_df.shape[1]} raw features, "
-        f"positive={int((y == 1).sum())}")
-
-    train_rows, test_rows = split_holdout(data, y, groups, args.test_frac, seed)
-    log(f"[split] train={len(train_rows)} holdout={len(test_rows)} "
-        f"| holdout positive={int((y[test_rows] == 1).sum())}")
-
-    X_train_df = X_df.iloc[train_rows].reset_index(drop=True)
-    y_train = y[train_rows]
-    g_train = groups[train_rows]
-    w_train = None if weights is None else weights[train_rows]
-
-    cs = tuple(float(v) for v in args.lasso_cs.split(",") if v.strip())
-    cache = {}
-
-    log("\n[1/4] outer group CV on the training part")
-    group_results, group_sizes = run_protocol("group", X_train_df, y_train, g_train, w_train,
-                                              args.families, seed, args.outer_splits,
-                                              args.n_iter, cache, cs)
-    group_table = summarize(group_results)
-    log(group_table.to_string(float_format=lambda v: f"{v:.4f}"))
-
-    row_table = None
-    if args.leak_check:
-        log("\n[2/4] same pipeline with row-wise CV (old protocol, for comparison)")
-        row_results, _ = run_protocol("row", X_train_df, y_train, g_train, w_train,
-                                      args.families, seed, args.outer_splits,
-                                      args.n_iter, cache, cs)
-        row_table = summarize(row_results)
-        log(row_table.to_string(float_format=lambda v: f"{v:.4f}"))
-        merged = group_table.merge(row_table, on="model", suffixes=("_group", "_row"))
-        merged["inflation"] = merged["auc_mean_row"] - merged["auc_mean_group"]
-        merged = merged.sort_values("inflation", ascending=False)
-        log("\n[leak-check] AUC gap (row-wise minus group-wise):")
-        log(merged[["model", "auc_mean_group", "auc_mean_row", "inflation"]]
-            .to_string(float_format=lambda v: f"{v:.4f}"))
-        merged.to_csv(os.path.join(run_dir, "leak_check.csv"), index=False)
-    else:
-        log("\n[2/4] leak-check skipped (--no-leak-check)")
-
-    log("\n[3/4] selecting the final model by outer group CV AUC")
-    base_table = group_table[group_table["model"].isin(args.families)]
-    final_name = str(base_table.iloc[0]["model"])
-    final_rows = np.arange(len(y_train))
-    best_params, _ = tune_family(final_name, X_train_df, y_train, g_train, final_rows,
-                                 seed, args.n_iter, cache, w_train, "group", cs)
-    preprocessor = get_preprocessor(cache, X_train_df, y_train, final_rows, seed, cs)
-    X_fit = preprocessor.transform(X_train_df)
-    model = fit_estimator(build_model(final_name, best_params, seed), X_fit, y_train, w_train)
-    log(f"[model] {final_name} params={json.dumps(best_params)} "
-        f"selected_features={X_fit.shape[1]}")
-
-    log("\n[4/4] holdout evaluation (single shot)")
-    X_test = preprocessor.transform(X_df.iloc[test_rows])
-    y_test = y[test_rows]
-    test_prob = model.predict_proba(X_test)[:, 1]
-    holdout = summarize_holdout(y_test, test_prob, seed)
-    log(f"[holdout] AUC={holdout['auc']:.4f} "
-        f"(95% CI {holdout['auc_ci_low']:.4f}-{holdout['auc_ci_high']:.4f}) "
-        f"acc={holdout['accuracy']:.4f} f1={holdout['f1']:.4f} n={holdout['n_samples']}")
-
-    joblib.dump(model, os.path.join(run_dir, "model.joblib"))
-    joblib.dump(preprocessor.as_dict(), os.path.join(run_dir, "preprocess.joblib"))
-    pd.DataFrame({"smiles": data.iloc[test_rows]["smiles"].to_numpy(),
-                  "group": groups[test_rows],
-                  "y_true": y_test,
-                  "y_prob": test_prob}).to_csv(os.path.join(run_dir, "holdout_predictions.csv"),
-                                               index=False)
-    with open(os.path.join(run_dir, "selected_features.json"), "w", encoding="utf-8") as handle:
-        json.dump(preprocessor.selected_columns, handle, indent=2)
-    with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "config": vars(args),
-            "final_model": final_name,
-            "final_params": best_params,
-            "n_features_raw": int(X_df.shape[1]),
-            "n_features_selected": int(X_fit.shape[1]),
-            "group_cv": group_table.to_dict(orient="records"),
-            "row_cv": None if row_table is None else row_table.to_dict(orient="records"),
-            "holdout": holdout,
-            "group_cv_selected_sizes": group_sizes,
-            "runtime_seconds": round(time.time() - started, 1),
-            "data": {"rows": int(len(data)), "train": int(len(train_rows)),
-                     "holdout": int(len(test_rows)),
-                     "groups": int(len(np.unique(groups)))},
-        }, handle, indent=2)
-    group_table.to_csv(os.path.join(run_dir, "cv_group.csv"), index=False)
-    if row_table is not None:
-        row_table.to_csv(os.path.join(run_dir, "cv_row.csv"), index=False)
-
-    log(f"\n[done] artifacts in {run_dir} ({time.time() - started:.0f}s)")
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+gc.collect()
